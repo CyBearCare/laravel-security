@@ -37,14 +37,39 @@ class SendDataCommand extends Command
         // Show storage stats first
         $this->showStorageStats();
         
-        // Send untransmitted data
+        // Get count of untransmitted data first
+        $stats = $this->collectionManager->getStorageStats();
+        $untransmittedCount = $stats['untransmitted_collections'] + $stats['untransmitted_packages'];
+        
+        if ($untransmittedCount === 0) {
+            $this->warn('⚠️  No untransmitted data to send');
+            return 0;
+        }
+        
+        // Send untransmitted data with progress bar
         $this->info('Sending untransmitted data...');
+        
+        $progressBar = $this->output->createProgressBar($untransmittedCount);
+        $progressBar->setFormat(' %current%/%max% [%bar%] %percent:3s%% - %message%');
+        $progressBar->setMessage('Sending data...');
+        $progressBar->start();
+        
+        $sentCount = 0;
+        
+        // This is a simplified progress tracking - in reality the sendUntransmittedData
+        // method would need to be refactored to support progress callbacks
         $sent = $this->collectionManager->sendUntransmittedData();
+        
+        $progressBar->advance($untransmittedCount);
+        $progressBar->setMessage('Transmission completed');
+        $progressBar->finish();
+        $this->line('');
+        $this->line('');
         
         if ($sent > 0) {
             $this->info("✅ Successfully sent {$sent} data collection(s)");
         } else {
-            $this->warn('⚠️  No data to send or transmission failed');
+            $this->warn('⚠️  Transmission failed');
         }
         
         // Cleanup old data if requested

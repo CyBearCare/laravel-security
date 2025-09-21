@@ -29,17 +29,38 @@ class StatusCommand extends Command
         $this->info('🛡️  Cybear Laravel Security Status');
         $this->line('');
 
-        $this->showConfigurationStatus();
-        $this->line('');
-        $this->showApiConnectionStatus();
-        $this->line('');
-        $this->showWafStatus();
-        $this->line('');
-        $this->showAuditingStatus();
-        $this->line('');
-        $this->showDataCollectionStatus();
-        $this->line('');
-        $this->showSecurityMetrics();
+        $steps = [
+            'Configuration Status' => 'showConfigurationStatus',
+            'API Connection' => 'showApiConnectionStatus',
+            'WAF Status' => 'showWafStatus',
+            'Auditing Status' => 'showAuditingStatus',
+            'Data Collection Status' => 'showDataCollectionStatus',
+            'Security Metrics' => 'showSecurityMetrics'
+        ];
+        
+        $progressBar = $this->output->createProgressBar(count($steps));
+        $progressBar->setFormat(' [%bar%] %percent:3s%% - %message%');
+        $progressBar->setMessage('Loading status...');
+        $progressBar->start();
+        
+        foreach ($steps as $message => $method) {
+            $progressBar->setMessage("Checking {$message}...");
+            
+            // Clear the progress bar temporarily to show the output
+            $progressBar->clear();
+            
+            // Call the method
+            $this->{$method}();
+            $this->line('');
+            
+            // Redisplay the progress bar
+            $progressBar->display();
+            $progressBar->advance();
+        }
+        
+        $progressBar->setMessage('Status check complete');
+        $progressBar->finish();
+        $progressBar->clear();
 
         return 0;
     }
@@ -183,33 +204,37 @@ class StatusCommand extends Command
     {
         $this->line('<fg=blue>📈 Security Metrics (Last 24h)</>');
         
-        $metrics = [
-            'Total Requests' => AuditLog::where('event_type', 'http_request')
-                ->where('created_at', '>=', now()->subDay())
-                ->count(),
-            'Blocked Requests' => BlockedRequest::where('created_at', '>=', now()->subDay())->count(),
-            'Failed Logins' => AuditLog::where('event_type', 'login_failure')
-                ->where('created_at', '>=', now()->subDay())
-                ->count(),
-        ];
+        try {
+            $metrics = [
+                'Total Requests' => AuditLog::where('event_type', 'http_request')
+                    ->where('created_at', '>=', now()->subDay())
+                    ->count(),
+                'Blocked Requests' => BlockedRequest::where('created_at', '>=', now()->subDay())->count(),
+                'Failed Logins' => AuditLog::where('event_type', 'login_failure')
+                    ->where('created_at', '>=', now()->subDay())
+                    ->count(),
+            ];
 
-        foreach ($metrics as $metric => $value) {
-            $formatted = number_format($value);
-            $this->line("  {$metric}: {$formatted}");
-        }
+            foreach ($metrics as $metric => $value) {
+                $formatted = number_format($value);
+                $this->line("  {$metric}: {$formatted}");
+            }
 
-        // Show top blocked IPs
-        $topBlockedIps = BlockedRequest::where('created_at', '>=', now()->subDay())
-            ->selectRaw('ip_address, COUNT(*) as count')
-            ->groupBy('ip_address')
-            ->orderByDesc('count')
-            ->limit(3)
-            ->get();
+            // Show top blocked IPs
+            $topBlockedIps = BlockedRequest::where('created_at', '>=', now()->subDay())
+                ->selectRaw('ip_address, COUNT(*) as count')
+                ->groupBy('ip_address')
+                ->orderByDesc('count')
+                ->limit(3)
+                ->get();
 
-        if ($topBlockedIps->count() > 0) {
-            $this->line("  Top Blocked IPs: " . $topBlockedIps->map(function($ip) {
-                return "{$ip->ip_address} ({$ip->count})";
-            })->implode(', '));
+            if ($topBlockedIps->count() > 0) {
+                $this->line("  Top Blocked IPs: " . $topBlockedIps->map(function($ip) {
+                    return "{$ip->ip_address} ({$ip->count})";
+                })->implode(', '));
+            }
+        } catch (\Exception $e) {
+            $this->warn('  Unable to retrieve security metrics: ' . $e->getMessage());
         }
     }
 }

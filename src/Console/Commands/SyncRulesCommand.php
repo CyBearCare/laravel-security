@@ -23,8 +23,27 @@ class SyncRulesCommand extends Command
         $this->info('🔄 Syncing WAF rules from Cybear platform...');
         $this->line('');
 
+        $progressBar = $this->output->createProgressBar(3);
+        $progressBar->setFormat(' [%bar%] %percent:3s%% - %message%');
+        
         try {
+            $progressBar->setMessage('Connecting to Cybear API...');
+            $progressBar->start();
+            
+            // Perform the sync
+            $progressBar->setMessage('Downloading rules...');
+            $progressBar->advance();
+            
             $syncedCount = $this->wafEngine->syncRules();
+            
+            $progressBar->setMessage('Updating local database...');
+            $progressBar->advance();
+            
+            $progressBar->setMessage('Sync completed');
+            $progressBar->advance();
+            $progressBar->finish();
+            $this->line('');
+            $this->line('');
             
             if ($syncedCount > 0) {
                 $this->info("✅ Successfully synced {$syncedCount} rules");
@@ -35,6 +54,8 @@ class SyncRulesCommand extends Command
             $this->showRulesSummary();
             
         } catch (\Exception $e) {
+            $progressBar->finish();
+            $this->line('');
             $this->error('❌ Rule synchronization failed: ' . $e->getMessage());
             return 1;
         }

@@ -52,7 +52,18 @@ class CollectDataCommand extends Command
 
         $this->info("Collecting {$type} data...");
         
+        $progressBar = $this->output->createProgressBar(1);
+        $progressBar->setFormat(' [%bar%] %percent:3s%% - %message%');
+        $progressBar->setMessage("Collecting {$type} data...");
+        $progressBar->start();
+        
         $data = $this->collectionManager->collectByType($type);
+        
+        $progressBar->advance();
+        $progressBar->setMessage('Collection completed');
+        $progressBar->finish();
+        $this->line('');
+        $this->line('');
         
         if (empty($data)) {
             $this->warn("No data collected for {$type} (collector may be disabled)");
@@ -75,8 +86,40 @@ class CollectDataCommand extends Command
     {
         $this->info('Collecting all enabled data...');
         
-        $data = $this->collectionManager->collectAll();
-        $collectors = $data['collectors'] ?? [];
+        $availableCollectors = $this->collectionManager->getAvailableCollectors();
+        $progressBar = $this->output->createProgressBar(count($availableCollectors));
+        $progressBar->setFormat(' %current%/%max% [%bar%] %percent:3s%% - %message%');
+        $progressBar->setMessage('Starting...');
+        $progressBar->start();
+        
+        $collectedData = [
+            'application_id' => config('cybear.app_id', config('app.name')),
+            'collection_timestamp' => now()->toISOString(),
+            'collectors' => []
+        ];
+        
+        foreach ($availableCollectors as $type) {
+            $progressBar->setMessage("Collecting {$type} data...");
+            
+            try {
+                $data = $this->collectionManager->collectByType($type);
+                if (!empty($data)) {
+                    $collectedData['collectors'][$type] = $data;
+                }
+            } catch (\Exception $e) {
+                // Log error but continue with other collectors
+                \Log::warning("Failed to collect {$type} data: " . $e->getMessage());
+            }
+            
+            $progressBar->advance();
+        }
+        
+        $progressBar->setMessage('Collection completed');
+        $progressBar->finish();
+        $this->line('');
+        $this->line('');
+        
+        $collectors = $collectedData['collectors'];
         
         if (empty($collectors)) {
             $this->warn('No data collected (all collectors may be disabled)');
@@ -85,14 +128,14 @@ class CollectDataCommand extends Command
 
         $this->info("✅ Data collection completed");
         $this->line("Collectors run: " . count($collectors));
-        $this->line("Total data size: " . $this->formatDataSize($data));
+        $this->line("Total data size: " . $this->formatDataSize($collectedData));
         
         foreach ($collectors as $type => $collectorData) {
             $this->showDataSummary($type, $collectorData);
         }
 
         if ($shouldSend) {
-            $this->sendToApi($data);
+            $this->sendToApi($collectedData);
         } else {
             $this->line('');
             $this->line('💡 Use --send flag to transmit data to Cybear platform');

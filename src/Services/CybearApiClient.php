@@ -58,7 +58,7 @@ class CybearApiClient
         }
 
         try {
-            $response = $this->makeRequest('GET', '/laravel/auth/verify');
+            $response = $this->makeRequest('GET', '/api/laravel/auth/verify');
             return $response['success'] ?? false;
         } catch (\Exception $e) {
             Log::error('Cybear API authentication failed', [
@@ -71,12 +71,12 @@ class CybearApiClient
 
     public function verifyAuth(): array
     {
-        return $this->makeRequest('GET', '/laravel/auth/verify');
+        return $this->makeRequest('GET', '/api/laravel/auth/verify');
     }
 
     public function sendCollectedData(array $data): array
     {
-        return $this->makeRequest('POST', '/laravel/data/collect', $data);
+        return $this->makeRequest('POST', '/api/laravel/data/collect', $data);
     }
 
     public function syncRules(): array
@@ -89,7 +89,7 @@ class CybearApiClient
             $params['since'] = $lastSync;
         }
 
-        $response = $this->makeRequest('GET', '/laravel/rules/sync', $params);
+        $response = $this->makeRequest('GET', '/api/laravel/rules/sync', $params);
         
         if (!empty($response['data']['rules'])) {
             Cache::put($cacheKey, now()->toISOString(), 3600);
@@ -101,7 +101,7 @@ class CybearApiClient
 
     public function getHealthStatus(): array
     {
-        return $this->makeRequest('GET', '/laravel/health');
+        return $this->makeRequest('GET', '/api/laravel/health');
     }
 
     public function receiveConfigUpdates(): array
@@ -114,7 +114,7 @@ class CybearApiClient
     public function sendAuditLogs(array $logs): bool
     {
         try {
-            $this->makeRequest('POST', '/laravel/audit/submit', [
+            $this->makeRequest('POST', '/api/laravel/audit/submit', [
                 'logs' => $logs,
             ]);
             return true;
@@ -130,7 +130,7 @@ class CybearApiClient
     public function sendBlockedRequests(array $blockedRequests): bool
     {
         try {
-            $this->makeRequest('POST', '/laravel/blocked/submit', [
+            $this->makeRequest('POST', '/api/laravel/blocked/submit', [
                 'blocked_requests' => $blockedRequests,
             ]);
             return true;
@@ -146,7 +146,7 @@ class CybearApiClient
     public function initOrActivate(): array
     {
         try {
-            return $this->makeRequest('POST', '/laravel/init-or-activate', [
+            return $this->makeRequest('POST', '/api/laravel/init-or-activate', [
                 'app_url' => config('app.url'),
                 'app_name' => config('app.name'),
                 'laravel_version' => app()->version(),
@@ -163,7 +163,7 @@ class CybearApiClient
     public function verify(): array
     {
         try {
-            return $this->makeRequest('POST', '/laravel/verify', [
+            return $this->makeRequest('POST', '/api/laravel/verify', [
                 'app_url' => config('app.url'),
             ]);
         } catch (\Exception $e) {

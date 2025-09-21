@@ -29,33 +29,63 @@ class SetupCommand extends Command
             return 1;
         }
 
+        // Setup progress
+        $steps = [
+            'Validating API key',
+            'Updating environment file',
+            'Publishing configuration',
+            'Running database migrations',
+            'Verifying domain ownership',
+            'Syncing security rules'
+        ];
+        
+        $progressBar = $this->output->createProgressBar(count($steps));
+        $progressBar->setFormat(' %current%/%max% [%bar%] %percent:3s%% - %message%');
+        $progressBar->setMessage('Starting setup...');
+        $progressBar->start();
+        
         // Validate API key
-        $this->info('Validating API key...');
+        $progressBar->setMessage($steps[0]);
         if (!$this->validateApiKey($apiKey)) {
+            $progressBar->finish();
+            $this->line('');
             $this->error('Invalid API key or unable to connect to Cybear platform');
             return 1;
         }
+        $progressBar->advance();
 
         // Update environment file
+        $progressBar->setMessage($steps[1]);
         $this->updateEnvironmentFile($apiKey);
+        $progressBar->advance();
 
         // Publish configuration
-        $this->call('vendor:publish', [
+        $progressBar->setMessage($steps[2]);
+        $this->callSilent('vendor:publish', [
             '--tag' => 'cybear-config',
             '--force' => true,
         ]);
+        $progressBar->advance();
 
         // Run migrations
-        $this->info('Running database migrations...');
-        $this->call('migrate');
+        $progressBar->setMessage($steps[3]);
+        $this->callSilent('migrate');
+        $progressBar->advance();
 
         // Auto-verify domain
-        $this->info('Verifying domain ownership...');
-        $this->call('cybear:verify-domain');
+        $progressBar->setMessage($steps[4]);
+        $this->callSilent('cybear:verify-domain');
+        $progressBar->advance();
 
         // Sync initial rules
-        $this->info('Syncing security rules...');
-        $this->call('cybear:sync');
+        $progressBar->setMessage($steps[5]);
+        $this->callSilent('cybear:sync');
+        $progressBar->advance();
+        
+        $progressBar->setMessage('Setup completed');
+        $progressBar->finish();
+        $this->line('');
+        $this->line('');
 
         $this->line('');
         $this->info('✅ Cybear Laravel Security has been successfully configured!');
@@ -122,6 +152,5 @@ class SetupCommand extends Command
         }
 
         File::put($envFile, $envContent);
-        $this->info('Environment file updated');
     }
 }
