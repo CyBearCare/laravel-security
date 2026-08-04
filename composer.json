@@ -1,0 +1,31 @@
+{
+    "name": "cybear-care/laravel-security",
+    "description": "Laravel-native security telemetry, WAF monitoring, posture checks, and DAST context for Cybear",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Cybear Care",
+            "email": "info@cybear.care"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "laravel/framework": "^12.0|^13.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "CybearCare\\LaravelSecurity\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "CybearCare\\LaravelSecurity\\CybearSecurityServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
