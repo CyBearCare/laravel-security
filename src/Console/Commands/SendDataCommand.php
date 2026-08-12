@@ -37,7 +37,6 @@ class SendDataCommand extends Command
         $this->line('');
         $this->showStorageStats();
 
-
         $stats = $this->collectionManager->getStorageStats();
         if (isset($stats['error'])) {
             $this->error($stats['error']);
@@ -78,7 +77,6 @@ class SendDataCommand extends Command
             $this->performCleanup();
         }
 
-
         $this->line('');
         $this->showStorageStats();
 
@@ -102,6 +100,7 @@ class SendDataCommand extends Command
         $this->line("  Package rows awaiting inventory acknowledgement: {$stats['untransmitted_packages']}");
         $this->line("  Untransmitted audit logs: {$stats['untransmitted_audit_logs']}");
         $this->line("  Untransmitted blocked requests: {$stats['untransmitted_blocked_requests']}");
+        $this->line("  Queued threat evidence: {$stats['untransmitted_threat_events']}");
 
         if ($stats['latest_collection']) {
             $this->line("  Latest collection: {$stats['latest_collection']->format('Y-m-d H:i:s')}");
@@ -142,7 +141,12 @@ class SendDataCommand extends Command
                 ->where('transmitted_at', '<', $cutoffDate)
                 ->delete();
 
-            $this->info("Cleanup complete: {$deletedCollections} collections, {$deletedPackages} packages, {$deletedAuditLogs} audit logs, and {$deletedBlockedRequests} blocked requests removed.");
+            $deletedThreatEvents = DB::table('cybear_threat_events')
+                ->where('transmitted', true)
+                ->where('transmitted_at', '<', $cutoffDate)
+                ->delete();
+
+            $this->info("Cleanup complete: {$deletedCollections} collections, {$deletedPackages} packages, {$deletedAuditLogs} audit logs, {$deletedBlockedRequests} blocked requests, and {$deletedThreatEvents} threat events removed.");
 
         } catch (\Exception $e) {
             $this->error('Failed to cleanup old data: '.$e->getMessage());

@@ -6,6 +6,7 @@ use Carbon\Carbon;
 use CybearCare\LaravelSecurity\Core\Api\CybearApiClient;
 use CybearCare\LaravelSecurity\Models\AuditLog;
 use CybearCare\LaravelSecurity\Models\BlockedRequest;
+use CybearCare\LaravelSecurity\Models\ThreatEvent;
 use CybearCare\LaravelSecurity\Models\WafRule;
 use CybearCare\LaravelSecurity\Services\DataCollectionManager;
 use CybearCare\LaravelSecurity\Services\SyncOrchestrator;
@@ -80,6 +81,9 @@ class StatusCommand extends Command
             'WAF Rule Budget' => number_format((int) config('cybear.waf.max_rules', 500)),
             'WAF Conditions Per Rule' => number_format((int) config('cybear.waf.max_conditions_per_rule', 50)),
             'WAF Inspection Limit' => $this->formatBytes((int) config('cybear.waf.max_inspection_bytes', 131072)),
+            'Threat Evidence Sensor' => $configuredState(
+                config('cybear.threat_reporting.enabled', true) === true
+            ),
             'DAST Correlation' => $configuredState(
                 config('cybear.dast.correlation_enabled', false) === true
                 && is_string(config('cybear.dast.signing_key'))
@@ -264,7 +268,8 @@ class StatusCommand extends Command
 
         if (config('cybear.enabled', false) !== true) {
             $pending = AuditLog::where('transmitted', false)->count()
-                + BlockedRequest::where('transmitted', false)->count();
+                + BlockedRequest::where('transmitted', false)->count()
+                + ThreatEvent::where('transmitted', false)->count();
 
             $this->line('  Status: [INACTIVE - PACKAGE DISABLED]');
             $this->line("  Pending records: {$pending}");

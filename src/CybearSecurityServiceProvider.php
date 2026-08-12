@@ -104,6 +104,7 @@ use CybearCare\LaravelSecurity\Services\OpenApiSchemaGenerator;
 use CybearCare\LaravelSecurity\Services\PerformanceCollector;
 use CybearCare\LaravelSecurity\Services\SecurityDataCollector;
 use CybearCare\LaravelSecurity\Services\SyncOrchestrator;
+use CybearCare\LaravelSecurity\Services\ThreatReporter;
 use Illuminate\Auth\Events\Failed;
 use Illuminate\Auth\Events\Lockout;
 use Illuminate\Auth\Events\Login;
@@ -156,7 +157,6 @@ class CybearSecurityServiceProvider extends ServiceProvider
             );
         });
 
-
         $this->app->singleton(CybearApiClient::class, function ($app) {
             return new CybearApiClient(
                 $app->make(CybearConfig::class),
@@ -165,13 +165,11 @@ class CybearSecurityServiceProvider extends ServiceProvider
             );
         });
 
-
         $this->app->singleton(WafRuleRepositoryInterface::class, EloquentWafRuleRepository::class);
         $this->app->singleton(AuditLogRepositoryInterface::class, EloquentAuditLogRepository::class);
         $this->app->singleton(BlockedRequestRepositoryInterface::class, EloquentBlockedRequestRepository::class);
         $this->app->singleton(CollectedDataRepositoryInterface::class, EloquentCollectedDataRepository::class);
         $this->app->singleton(PackageDataRepositoryInterface::class, EloquentPackageDataRepository::class);
-
 
         $this->app->singleton(WafEngine::class, function ($app) {
             return new WafEngine(
@@ -183,7 +181,6 @@ class CybearSecurityServiceProvider extends ServiceProvider
             );
         });
 
-
         $this->app->singleton(AuditLogger::class, function ($app) {
             return new AuditLogger(
                 $app->make(AuditLogRepositoryInterface::class),
@@ -193,7 +190,6 @@ class CybearSecurityServiceProvider extends ServiceProvider
                 $app->make(CybearConfig::class)
             );
         });
-
 
         $this->app->singleton(DataCollectionManager::class, function ($app) {
             return new DataCollectionManager(
@@ -206,11 +202,9 @@ class CybearSecurityServiceProvider extends ServiceProvider
             );
         });
 
-
         $this->app->singleton(CoreDataCollectionManager::class, function ($app) {
             return $app->make(DataCollectionManager::class);
         });
-
 
         $this->app->singleton(SyncOrchestrator::class, function ($app) {
             return new SyncOrchestrator(
@@ -219,10 +213,9 @@ class CybearSecurityServiceProvider extends ServiceProvider
             );
         });
 
-
         $this->app->singleton(DomainVerificationService::class);
         $this->app->singleton(OpenApiSchemaGenerator::class);
-
+        $this->app->singleton(ThreatReporter::class);
 
         $this->app->singleton(CapabilityDetector::class, function ($app) {
             return new CapabilityDetector(
@@ -293,11 +286,9 @@ class CybearSecurityServiceProvider extends ServiceProvider
         });
         $this->app->singleton(PostureRunner::class);
 
-
         $this->app->singleton(SensitiveFileGuard::class, function () {
             return new SensitiveFileGuard(config('cybear.sensitive_files', []));
         });
-
 
         $this->app->singleton(SecurityHeadersManager::class, function () {
             return new SecurityHeadersManager(config('cybear.security_headers', []));
@@ -332,10 +323,8 @@ class CybearSecurityServiceProvider extends ServiceProvider
         $logger = $this->app->make(LoggerInterface::class);
         $config = $this->app->make(CybearConfig::class);
 
-
         $dataManager->addCollector('environment', new EnvironmentCollector($cache, $logger, $config));
         $dataManager->addCollector('packages', new PackageCollector($cache, $logger, $config));
-
 
         $dataManager->addCollector('application_structure', new ApplicationStructureCollector);
         $dataManager->addCollector('auth', new AuthCollector);
@@ -412,9 +401,11 @@ class CybearSecurityServiceProvider extends ServiceProvider
 
     protected function registerAuthenticationListeners(): void
     {
-        if (! config('cybear.enabled', false)
-            || ! config('cybear.audit.enabled', true)
-            || ! config('cybear.audit.log_authentication', true)) {
+        $auditEnabled = config('cybear.audit.enabled', true)
+            && config('cybear.audit.log_authentication', true);
+        $threatReportingEnabled = config('cybear.threat_reporting.enabled', true);
+
+        if (! config('cybear.enabled', false) || (! $auditEnabled && ! $threatReportingEnabled)) {
             return;
         }
 
@@ -461,13 +452,24 @@ class CybearSecurityServiceProvider extends ServiceProvider
                 ? (string) $user->getAuthIdentifier()
                 : null;
 
-            $this->app->make(AuditLogger::class)->logAuthenticationEvent(
-                $event,
-                new LaravelRequestAdapter($request),
-                $userId,
-                $email,
-                $request->hasSession() ? $request->session()->getId() : null,
-            );
+            if (in_array($event, ['login_failed', 'login_lockout'], true)
+                && config('cybear.threat_reporting.enabled', true)) {
+                $this->app->make(ThreatReporter::class)->reportAuthenticationFailure(
+                    $request,
+                    $event === 'login_lockout',
+                );
+            }
+
+            if (config('cybear.audit.enabled', true)
+                && config('cybear.audit.log_authentication', true)) {
+                $this->app->make(AuditLogger::class)->logAuthenticationEvent(
+                    $event,
+                    new LaravelRequestAdapter($request),
+                    $userId,
+                    $email,
+                    $request->hasSession() ? $request->session()->getId() : null,
+                );
+            }
         } catch (Throwable $exception) {
             Log::warning('Failed to record a Cybear authentication event', [
                 'event' => $event,
