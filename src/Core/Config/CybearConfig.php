@@ -78,6 +78,18 @@ class CybearConfig
         return (int) $this->get('waf.max_conditions_per_rule', 50);
     }
 
+    public function getWafTruncationAction(): string
+    {
+        $action = (string) $this->get('waf.truncation_action', 'block');
+
+        return in_array($action, ['allow', 'block'], true) ? $action : 'block';
+    }
+
+    public function getWafMaxRegexEvaluations(): int
+    {
+        return (int) $this->get('waf.max_regex_evaluations', 100);
+    }
+
     // DAST correlation
     public function isDastCorrelationEnabled(): bool
     {
@@ -307,6 +319,8 @@ class CybearConfig
                 'max_inspection_bytes' => 131072,
                 'max_rules' => 500,
                 'max_conditions_per_rule' => 50,
+                'max_regex_evaluations' => 100,
+                'truncation_action' => 'block',
             ],
             'dast' => [
                 'correlation_enabled' => false,

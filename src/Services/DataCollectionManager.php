@@ -11,6 +11,7 @@ use CybearCare\LaravelSecurity\Models\AuditLog;
 use CybearCare\LaravelSecurity\Models\BlockedRequest;
 use CybearCare\LaravelSecurity\Models\CollectedData;
 use CybearCare\LaravelSecurity\Models\PackageData;
+use CybearCare\LaravelSecurity\Models\ThreatEvent;
 use CybearCare\LaravelSecurity\Models\WafRule;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
@@ -103,6 +104,7 @@ class DataCollectionManager extends CoreDataCollectionManager
 
         $sent = 0;
         foreach ([
+            'threat_events' => fn () => $this->sendUntransmittedThreatEvents(),
             'collections' => fn () => $this->sendUntransmittedCollectedData(),
             'audit_logs' => fn () => $this->sendUntransmittedAuditLogs(),
             'blocked_requests' => fn () => $this->sendUntransmittedBlockedRequests(),
@@ -132,6 +134,9 @@ class DataCollectionManager extends CoreDataCollectionManager
                 'untransmitted_audit_logs' => AuditLog::untransmitted()->count(),
                 'total_blocked_requests' => BlockedRequest::count(),
                 'untransmitted_blocked_requests' => BlockedRequest::untransmitted()->count(),
+                'total_threat_events' => ThreatEvent::count(),
+                'untransmitted_threat_events' => ThreatEvent::untransmitted()->count(),
+                'retryable_threat_events' => ThreatEvent::due()->count(),
                 'latest_collection' => CollectedData::latest('collected_at')->first()?->collected_at,
                 'oldest_untransmitted' => CollectedData::untransmitted()
                     ->oldest('collected_at')
@@ -140,7 +145,8 @@ class DataCollectionManager extends CoreDataCollectionManager
             ];
             $stats['pending_total'] = $stats['untransmitted_collections']
                 + $stats['untransmitted_audit_logs']
-                + $stats['untransmitted_blocked_requests'];
+                + $stats['untransmitted_blocked_requests']
+                + $stats['retryable_threat_events'];
 
             return $stats;
         } catch (Throwable $exception) {
@@ -197,6 +203,46 @@ class DataCollectionManager extends CoreDataCollectionManager
                                 ->update(['transmitted' => true, 'transmitted_at' => now()]);
                         }
                     }
+                }
+            });
+
+        return $sent;
+    }
+
+    protected function sendUntransmittedThreatEvents(): int
+    {
+        $sent = 0;
+        $batchSize = min(250, $this->batchSize());
+
+        ThreatEvent::due()
+            ->orderBy('id')
+            ->chunkById($batchSize, function (Collection $events) use (&$sent): void {
+                $response = $this->apiClient->sendSecurityEvents(
+                    $events->map(fn (ThreatEvent $event): array => $event->payload)->all(),
+                    $this->outboxId(
+                        'threat',
+                        $events->modelKeys(),
+                        $events->pluck('event_id')->all(),
+                    ),
+                );
+
+                if ($this->securityEventBatchWasAcknowledged($response, $events->count())) {
+                    ThreatEvent::query()->whereKey($events->modelKeys())->update([
+                        'transmitted' => true,
+                        'transmitted_at' => now(),
+                        'next_attempt_at' => null,
+                    ]);
+                    $sent += $events->count();
+
+                    return;
+                }
+
+                foreach ($events as $event) {
+                    $attempts = $event->attempts + 1;
+                    $event->update([
+                        'attempts' => $attempts,
+                        'next_attempt_at' => now()->addSeconds($this->retryDelay($attempts)),
+                    ]);
                 }
             });
 
@@ -323,6 +369,24 @@ class DataCollectionManager extends CoreDataCollectionManager
         $processed = $response['processed_count'] ?? $response['accepted_count'] ?? null;
 
         return $processed === null || (int) $processed === $expected;
+    }
+
+    protected function securityEventBatchWasAcknowledged(array|false $response, int $expected): bool
+    {
+        if ($response === false || ($response['success'] ?? true) === false) {
+            return false;
+        }
+
+        return (int) ($response['accepted'] ?? 0)
+            + (int) ($response['duplicates'] ?? 0) === $expected;
+    }
+
+    protected function retryDelay(int $attempts): int
+    {
+        $base = max(1, (int) config('cybear.threat_reporting.retry_base_seconds', 15));
+        $maximum = max($base, (int) config('cybear.threat_reporting.retry_max_seconds', 3600));
+
+        return min($maximum, $base * (2 ** min(20, max(0, $attempts - 1))));
     }
 
     protected function batchSize(): int

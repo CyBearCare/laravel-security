@@ -18,6 +18,14 @@ interface RequestInterface
 
     public function getAllInput(): array;
 
+    /** @return array<string, mixed> */
+    public function getQueryInput(): array;
+
+    /** @return array<string, mixed> */
+    public function getBodyInput(): array;
+
+    public function getRawBody(): string;
+
     public function getHeaders(): array;
 
     public function getHeader(string $name, string $default = ''): string;

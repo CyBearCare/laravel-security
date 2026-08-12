@@ -105,6 +105,31 @@ class CybearApiClient
         );
     }
 
+    public function sendSecurityEvents(array $events, string $batchId): array|false
+    {
+        try {
+            $response = $this->makeRequest('POST', '/api/security-events/batch', [
+                'protocol_version' => '1.0',
+                'batch_id' => $batchId,
+                'events' => $events,
+            ]);
+
+            $result = is_array($response['data'] ?? null) ? $response['data'] : $response;
+            if (array_key_exists('success', $response)) {
+                $result['success'] = $response['success'];
+            }
+
+            return $result;
+        } catch (Throwable $exception) {
+            $this->logger->error('Failed to send a Cybear security-event batch', [
+                'records_count' => count($events),
+                'error' => $exception->getMessage(),
+            ]);
+
+            return false;
+        }
+    }
+
     public function initOrActivate(string $appUrl, string $appName, string $frameworkVersion): array
     {
         return $this->makeRequest('POST', '/api/laravel/init-or-activate', [

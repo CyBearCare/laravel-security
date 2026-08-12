@@ -34,6 +34,10 @@ class WafEngine
 
     protected int $prevalidatedInvalidRuleCount = 0;
 
+    protected int $regexEvaluations = 0;
+
+    protected bool $inspectionBudgetExhausted = false;
+
     public function __construct(
         protected CybearApiClient $apiClient,
         protected WafRuleRepositoryInterface $ruleRepo,
@@ -54,6 +58,8 @@ class WafEngine
         $this->requestValueCache = [];
         $this->rulesPrevalidated = false;
         $this->prevalidatedInvalidRuleCount = 0;
+        $this->regexEvaluations = 0;
+        $this->inspectionBudgetExhausted = false;
         $startTime = microtime(true);
 
         if (! $this->enabled) {
@@ -87,9 +93,11 @@ class WafEngine
             'expired_rule_count' => 0,
             'out_of_scope_rule_count' => 0,
             'rollout_skipped_rule_count' => 0,
+            'rollout_monitor_rule_count' => 0,
             'rules_truncated' => count($loadedRules) > count($rules),
             'inspection_truncated' => false,
             'processing_time' => 0,
+            'regex_evaluations' => 0,
         ];
 
         foreach ($rules as $rule) {
@@ -108,10 +116,14 @@ class WafEngine
             $applicability = $hasLifecycleConstraint
                 ? $this->ruleApplicability($rule, $request)
                 : null;
-            if ($applicability !== null) {
+            $rolloutMonitor = $applicability === 'rollout_monitor';
+            if ($applicability !== null && ! $rolloutMonitor) {
                 $analysis[$applicability.'_rule_count']++;
 
                 continue;
+            }
+            if ($rolloutMonitor) {
+                $analysis['rollout_monitor_rule_count']++;
             }
 
             $analysis['rules_evaluated']++;
@@ -128,6 +140,10 @@ class WafEngine
             }
 
             if (! $matched) {
+                if ($this->inspectionBudgetExhausted) {
+                    break;
+                }
+
                 continue;
             }
 
@@ -145,6 +161,7 @@ class WafEngine
                 'version' => (int) ($rule['version'] ?? 1),
                 'finding_id' => $rule['finding_id'] ?? null,
                 'rollout_percentage' => (int) ($rule['rollout_percentage'] ?? 100),
+                'effective_action' => $rolloutMonitor ? 'monitor' : $rule['action'],
             ];
 
             $analysis['risk_score'] = min(
@@ -152,17 +169,7 @@ class WafEngine
                 $analysis['risk_score'] + $this->getSeverityScore($rule['severity']),
             );
 
-            try {
-                $this->ruleRepo->incrementTriggerCount($rule['rule_id']);
-                $this->ruleRepo->updateLastTriggered($rule['rule_id'], new \DateTimeImmutable);
-            } catch (\Throwable $exception) {
-                $this->logger->warning('Failed to update WAF rule trigger telemetry', [
-                    'rule_id' => $rule['rule_id'],
-                    'error_type' => $exception::class,
-                ]);
-            }
-
-            if ($rule['action'] !== 'monitor') {
+            if (! $rolloutMonitor && $rule['action'] !== 'monitor') {
                 $analysis['action'] = $rule['action'];
                 $analysis['rule_id'] = $rule['rule_id'];
                 $analysis['block_reason'] = 'A web application firewall rule matched.';
@@ -176,6 +183,16 @@ class WafEngine
 
         $analysis['processing_time'] = (microtime(true) - $startTime) * 1000;
         $analysis['inspection_truncated'] = $this->inspectionTruncated;
+        $analysis['regex_evaluations'] = $this->regexEvaluations;
+
+        if ($this->inspectionTruncated
+            && $analysis['action'] === 'allow'
+            && $this->config->getWafTruncationAction() === 'block') {
+            $analysis['action'] = 'block';
+            $analysis['rule_id'] = 'cybear.inspection_truncated';
+            $analysis['block_reason'] = 'The request exceeded a safe inspection boundary.';
+            $analysis['risk_score'] = max(7, $analysis['risk_score']);
+        }
 
         // Override action based on mode
         if ($this->mode === 'monitor' && $analysis['action'] !== 'allow') {
@@ -184,6 +201,28 @@ class WafEngine
         }
 
         return $analysis;
+    }
+
+    public function recordMatchedRules(array $analysis): void
+    {
+        $recorded = [];
+        foreach ((array) ($analysis['matched_rules'] ?? []) as $match) {
+            $ruleId = is_array($match) ? ($match['rule_id'] ?? null) : null;
+            if (! is_string($ruleId) || $ruleId === '' || isset($recorded[$ruleId])) {
+                continue;
+            }
+            $recorded[$ruleId] = true;
+
+            try {
+                $this->ruleRepo->incrementTriggerCount($ruleId);
+                $this->ruleRepo->updateLastTriggered($ruleId, new \DateTimeImmutable);
+            } catch (\Throwable $exception) {
+                $this->logger->warning('Failed to update WAF rule trigger telemetry', [
+                    'rule_id' => $ruleId,
+                    'error_type' => $exception::class,
+                ]);
+            }
+        }
     }
 
     protected function loadRules(): array
@@ -318,27 +357,39 @@ class WafEngine
 
     protected function evaluateCondition(array $condition, RequestInterface $request): bool
     {
-        $field = $condition['field'];
+        $field = is_string($condition['field'] ?? null) ? $condition['field'] : null;
+        $target = is_array($condition['target'] ?? null) ? $condition['target'] : null;
         $operator = $condition['operator'];
         $value = (string) $condition['value'];
 
-        $requestValue = $this->getRequestValue($field, $request);
-        if ($requestValue === null) {
+        $requestValues = $target === null
+            ? [$this->getRequestValue((string) $field, $request)]
+            : $this->getTargetValues($target, $request);
+        $requestValues = array_values(array_filter(
+            $requestValues,
+            static fn (mixed $requestValue): bool => is_string($requestValue),
+        ));
+        if ($requestValues === []) {
             return false;
         }
+
+        $comparisonField = $target === null
+            ? (string) $field
+            : $this->targetComparisonField($target);
 
         // Debug logging for rule evaluation
         if ($this->config->isWafDebugEnabled()) {
             $this->logger->debug('WAF condition evaluation', [
                 'field' => $field,
+                'target_source' => $target['source'] ?? null,
                 'operator' => $operator,
                 'rule_value_bytes' => strlen($value),
-                'request_value_bytes' => strlen($requestValue),
+                'request_value_bytes' => array_sum(array_map('strlen', $requestValues)),
             ]);
         }
 
         if ($operator !== 'regex') {
-            $value = $this->normalizeComparisonValue($field, $value);
+            $value = $this->normalizeComparisonValue($comparisonField, $value);
         }
 
         if ($value === ''
@@ -346,6 +397,28 @@ class WafEngine
             return false;
         }
 
+        $negative = in_array($operator, ['not_equals', 'not_contains'], true);
+
+        foreach ($requestValues as $requestValue) {
+            $matched = $this->evaluateValue($requestValue, $operator, $value, $field, $target);
+            if (! $negative && $matched) {
+                return true;
+            }
+            if ($negative && ! $matched) {
+                return false;
+            }
+        }
+
+        return $negative;
+    }
+
+    protected function evaluateValue(
+        string $requestValue,
+        string $operator,
+        string $value,
+        ?string $field,
+        ?array $target,
+    ): bool {
         switch ($operator) {
             case 'equals':
                 return $requestValue === $value;
@@ -360,11 +433,21 @@ class WafEngine
             case 'ends_with':
                 return str_ends_with($requestValue, $value);
             case 'regex':
-                // Validate regex pattern to prevent ReDoS attacks
+                $maximumRegexEvaluations = max(
+                    1,
+                    min(1000, $this->config->getWafMaxRegexEvaluations()),
+                );
+                if (++$this->regexEvaluations > $maximumRegexEvaluations) {
+                    $this->inspectionTruncated = true;
+                    $this->inspectionBudgetExhausted = true;
+
+                    return false;
+                }
                 if (! $this->isValidRegex($value)) {
                     $this->logger->warning('Invalid regex pattern in WAF rule', [
                         'pattern' => $value,
                         'field' => $field,
+                        'target_source' => $target['source'] ?? null,
                     ]);
 
                     return false;
@@ -415,6 +498,226 @@ class WafEngine
         return $this->requestValueCache[$field] = $value === null
             ? null
             : $this->normalizeComparisonValue($field, $this->bounded($value));
+    }
+
+    /** @return list<string> */
+    protected function getTargetValues(array $target, RequestInterface $request): array
+    {
+        $cacheKey = 'target:'.hash('sha256', serialize($target));
+        if (array_key_exists($cacheKey, $this->requestValueCache)) {
+            $cached = $this->requestValueCache[$cacheKey];
+
+            return $cached === null ? [] : json_decode($cached, true, 512, JSON_THROW_ON_ERROR);
+        }
+
+        $source = $target['source'];
+        $path = $target['path'];
+        $values = match ($source) {
+            'query' => $this->queryTargetValues($request, $path),
+            'body' => $this->selectorValues($request->getBodyInput(), $path),
+            'input' => $this->selectorValues($request->getAllInput(), $path),
+            'raw_body' => [$request->getRawBody()],
+            'livewire' => $this->livewireValues($request->getBodyInput(), $target),
+            default => [],
+        };
+        $comparisonField = $this->targetComparisonField($target);
+        $normalized = [];
+        foreach ($values as $value) {
+            $string = $this->inspectionString($value);
+            if ($string === null) {
+                continue;
+            }
+            $normalized[] = $this->normalizeComparisonValue(
+                $comparisonField,
+                $this->bounded($string),
+            );
+            if (count($normalized) >= 100) {
+                $this->inspectionTruncated = true;
+                break;
+            }
+        }
+
+        $this->requestValueCache[$cacheKey] = json_encode(
+            $normalized,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR,
+        );
+
+        return $normalized;
+    }
+
+    /** @return list<mixed> */
+    protected function queryTargetValues(RequestInterface $request, array $path): array
+    {
+        $rawMatches = [];
+        $queryString = $request->getQueryString();
+        if (is_string($queryString) && $queryString !== '') {
+            foreach (preg_split('/[&;]/', $queryString) ?: [] as $pair) {
+                [$rawKey, $rawValue] = array_pad(explode('=', $pair, 2), 2, '');
+                $key = rawurldecode(str_replace('+', ' ', $rawKey));
+                if ($this->selectorPathMatches($path, $this->queryKeySegments($key))) {
+                    $rawMatches[] = rawurldecode(str_replace('+', ' ', $rawValue));
+                }
+            }
+        }
+
+        return $rawMatches !== []
+            ? $rawMatches
+            : $this->selectorValues($request->getQueryInput(), $path);
+    }
+
+    /** @return list<string> */
+    protected function queryKeySegments(string $key): array
+    {
+        if (! str_contains($key, '[')) {
+            return [$key];
+        }
+
+        preg_match_all('/^([^\[]+)|\[([^\]]*)\]/', $key, $matches, PREG_SET_ORDER);
+        $segments = [];
+        foreach ($matches as $match) {
+            $segment = $match[1] !== '' ? $match[1] : ($match[2] ?? '');
+            $segments[] = $segment === '' ? '*' : $segment;
+        }
+
+        return $segments;
+    }
+
+    protected function targetComparisonField(array $target): string
+    {
+        return match ($target['source'] ?? null) {
+            'query' => 'query_string',
+            'body', 'input', 'raw_body', 'livewire' => 'post_data',
+            default => '',
+        };
+    }
+
+    /** @return list<mixed> */
+    protected function selectorValues(mixed $value, array $path, int $depth = 0): array
+    {
+        if ($depth >= 6 || $path === []) {
+            return $path === [] ? [$value] : [];
+        }
+        if (! is_array($value)) {
+            return [];
+        }
+
+        $segment = array_shift($path);
+        if ($segment !== '*') {
+            return array_key_exists($segment, $value)
+                ? $this->selectorValues($value[$segment], $path, $depth + 1)
+                : [];
+        }
+
+        $matches = [];
+        foreach ($value as $item) {
+            array_push($matches, ...$this->selectorValues($item, $path, $depth + 1));
+            if (count($matches) >= 100) {
+                $this->inspectionTruncated = true;
+
+                return array_slice($matches, 0, 100);
+            }
+        }
+
+        return $matches;
+    }
+
+    /** @return list<mixed> */
+    protected function livewireValues(array $body, array $target): array
+    {
+        $components = $body['components'] ?? null;
+        if (! is_array($components)) {
+            return [];
+        }
+
+        $matches = [];
+        foreach ($components as $component) {
+            if (! is_array($component)) {
+                continue;
+            }
+            $snapshot = is_string($component['snapshot'] ?? null)
+                ? json_decode($component['snapshot'], true)
+                : null;
+            $componentName = is_array($snapshot) ? ($snapshot['memo']['name'] ?? null) : null;
+            if (isset($target['component']) && $componentName !== $target['component']) {
+                continue;
+            }
+
+            $calls = is_array($component['calls'] ?? null) ? $component['calls'] : [];
+            if (isset($target['operation'])) {
+                $operationFound = false;
+                foreach ($calls as $call) {
+                    if (is_array($call) && ($call['method'] ?? null) === $target['operation']) {
+                        $operationFound = true;
+                        break;
+                    }
+                }
+                if (! $operationFound) {
+                    continue;
+                }
+            }
+
+            $path = $target['path'];
+            $area = array_shift($path);
+            if ($area === 'updates') {
+                foreach ((array) ($component['updates'] ?? []) as $updatePath => $value) {
+                    if (! is_string($updatePath)) {
+                        continue;
+                    }
+                    $segments = $this->selectorSegments($updatePath);
+                    if ($this->selectorPathMatches($path, $segments)) {
+                        $matches[] = $value;
+                    }
+                }
+            } elseif ($area === 'calls') {
+                foreach ($calls as $call) {
+                    if (! is_array($call)
+                        || (isset($target['operation']) && ($call['method'] ?? null) !== $target['operation'])) {
+                        continue;
+                    }
+                    array_push($matches, ...$this->selectorValues($call, $path));
+                }
+            }
+
+            if (count($matches) >= 100) {
+                $this->inspectionTruncated = true;
+
+                return array_slice($matches, 0, 100);
+            }
+        }
+
+        return $matches;
+    }
+
+    /** @return list<string> */
+    protected function selectorSegments(string $path): array
+    {
+        $normalized = preg_replace('/\[([0-9]+)\]/', '.$1', $path) ?? $path;
+
+        return array_values(array_filter(explode('.', $normalized), 'strlen'));
+    }
+
+    protected function selectorPathMatches(array $expected, array $actual): bool
+    {
+        if (count($expected) !== count($actual)) {
+            return false;
+        }
+
+        foreach ($expected as $index => $segment) {
+            if ($segment !== '*' && $segment !== $actual[$index]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    protected function inspectionString(mixed $value): ?string
+    {
+        if (is_string($value) || is_numeric($value) || is_bool($value)) {
+            return (string) $value;
+        }
+
+        return is_array($value) ? $this->inspectionJson($value) : null;
     }
 
     protected function ipInRange(string $ip, string $range): bool
@@ -506,14 +809,17 @@ class WafEngine
         $value = str_replace("\0", '', $value);
 
         if (in_array($field, ['url', 'path', 'query_string', 'post_data', 'referer'], true)) {
-            for ($depth = 0; $depth < 3; $depth++) {
-                $decoded = rawurldecode($value);
+            for ($depth = 0; $depth < 6; $depth++) {
+                $decoded = html_entity_decode(
+                    rawurldecode(str_replace('+', ' ', $value)),
+                    ENT_QUOTES | ENT_HTML5,
+                    'UTF-8',
+                );
                 if ($decoded === $value) {
                     break;
                 }
                 $value = $decoded;
             }
-            $value = html_entity_decode($value, ENT_QUOTES | ENT_HTML5, 'UTF-8');
         }
 
         if ($field === 'path') {
@@ -808,7 +1114,9 @@ class WafEngine
 
         $rollout = (int) ($rule['rollout_percentage'] ?? 100);
         if ($rollout <= 0) {
-            return 'rollout_skipped';
+            return data_get($rule, 'metadata.rollout_fallback_action') === 'monitor'
+                ? 'rollout_monitor'
+                : 'rollout_skipped';
         }
 
         if ($rollout < 100) {
@@ -820,7 +1128,9 @@ class WafEngine
             );
             $bucket = (unpack('N', substr($digest, 0, 4))[1] % 100) + 1;
             if ($bucket > $rollout) {
-                return 'rollout_skipped';
+                return data_get($rule, 'metadata.rollout_fallback_action') === 'monitor'
+                    ? 'rollout_monitor'
+                    : 'rollout_skipped';
             }
         }
 
@@ -958,9 +1268,12 @@ class WafEngine
         }
 
         foreach ($rules as $condition) {
+            $field = $condition['field'] ?? null;
+            $target = $condition['target'] ?? null;
             if (! is_array($condition)
-                || ! is_string($condition['field'] ?? null)
-                || ! $this->isValidField($condition['field'])
+                || ! ((is_string($field) && $this->isValidField($field))
+                    || (is_array($target) && $this->isValidTarget($target)))
+                || (isset($condition['field']) && isset($condition['target']))
                 || ! is_string($condition['operator'] ?? null)
                 || ! in_array($condition['operator'], self::OPERATORS, true)
                 || ! array_key_exists('value', $condition)
@@ -969,6 +1282,45 @@ class WafEngine
                     $condition['operator'],
                     $condition['value'],
                 )) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    protected function isValidTarget(array $target): bool
+    {
+        $allowedKeys = ['source', 'path', 'component', 'operation'];
+        if (array_diff(array_keys($target), $allowedKeys) !== []
+            || ! in_array($target['source'] ?? null, ['query', 'body', 'input', 'raw_body', 'livewire'], true)
+            || ! is_array($target['path'] ?? null)
+            || count($target['path']) > 6) {
+            return false;
+        }
+
+        if (($target['source'] ?? null) !== 'raw_body' && $target['path'] === []) {
+            return false;
+        }
+        if (($target['source'] ?? null) === 'raw_body' && $target['path'] !== []) {
+            return false;
+        }
+        if (($target['source'] ?? null) === 'livewire'
+            && ! in_array($target['path'][0] ?? null, ['updates', 'calls'], true)) {
+            return false;
+        }
+
+        foreach ($target['path'] as $segment) {
+            if (! is_string($segment)
+                || preg_match('/^(?:\*|[A-Za-z0-9_-]{1,64})$/', $segment) !== 1) {
+                return false;
+            }
+        }
+
+        foreach (['component', 'operation'] as $key) {
+            if (isset($target[$key])
+                && (! is_string($target[$key])
+                    || preg_match('/^[A-Za-z0-9_.:-]{1,128}$/', $target[$key]) !== 1)) {
                 return false;
             }
         }

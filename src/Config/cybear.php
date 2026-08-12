@@ -33,6 +33,8 @@ return [
         'max_inspection_bytes' => env('CYBEAR_WAF_MAX_INSPECTION_BYTES', 131072),
         'max_rules' => env('CYBEAR_WAF_MAX_RULES', 500),
         'max_conditions_per_rule' => env('CYBEAR_WAF_MAX_CONDITIONS', 50),
+        'max_regex_evaluations' => env('CYBEAR_WAF_MAX_REGEX_EVALUATIONS', 100),
+        'truncation_action' => env('CYBEAR_WAF_TRUNCATION_ACTION', 'block'),
         'block_page' => env('CYBEAR_WAF_BLOCK_PAGE', null),
         'challenge_enabled' => env('CYBEAR_WAF_CHALLENGE_ENABLED', false),
         'log_allowed_requests' => env('CYBEAR_WAF_LOG_ALLOWED', false),
@@ -40,6 +42,17 @@ return [
 
         // Auto-sync settings
         'auto_sync' => env('CYBEAR_WAF_AUTO_SYNC', true),
+    ],
+
+    'threat_reporting' => [
+        'enabled' => env('CYBEAR_THREAT_REPORTING_ENABLED', true),
+        'max_inspection_bytes' => env('CYBEAR_THREAT_MAX_INSPECTION_BYTES', 32768),
+        'max_decode_passes' => env('CYBEAR_THREAT_MAX_DECODE_PASSES', 6),
+        'max_outbox_records' => env('CYBEAR_THREAT_MAX_OUTBOX_RECORDS', 5000),
+        'sample_seconds' => env('CYBEAR_THREAT_SAMPLE_SECONDS', 10),
+        'max_attempts' => env('CYBEAR_THREAT_MAX_ATTEMPTS', 10),
+        'retry_base_seconds' => env('CYBEAR_THREAT_RETRY_BASE_SECONDS', 15),
+        'retry_max_seconds' => env('CYBEAR_THREAT_RETRY_MAX_SECONDS', 3600),
     ],
 
     'dast' => [
@@ -66,6 +79,9 @@ return [
         ))),
         'excluded_ips' => [],
         'retention_days' => env('CYBEAR_AUDIT_RETENTION_DAYS', 90),
+        'max_outbox_records' => env('CYBEAR_AUDIT_MAX_OUTBOX_RECORDS', 5000),
+        'sample_seconds' => env('CYBEAR_WAF_TELEMETRY_SAMPLE_SECONDS', 10),
+        'sample_burst' => env('CYBEAR_WAF_TELEMETRY_SAMPLE_BURST', 2),
     ],
 
     'rate_limiting' => [

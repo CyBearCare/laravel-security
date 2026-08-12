@@ -6,8 +6,10 @@ use Closure;
 use CybearCare\LaravelSecurity\Adapter\LaravelRequestAdapter;
 use CybearCare\LaravelSecurity\Core\Audit\AuditLogger;
 use CybearCare\LaravelSecurity\Core\Waf\WafEngine;
+use CybearCare\LaravelSecurity\Services\ThreatReporter;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\Response;
@@ -19,6 +21,7 @@ class WafMiddleware
         protected WafEngine $wafEngine,
         protected AuditLogger $auditLogger,
         protected DastCorrelationMiddleware $dastCorrelation,
+        protected ThreatReporter $threatReporter,
     ) {}
 
     public function handle(Request $request, Closure $next)
@@ -57,15 +60,28 @@ class WafMiddleware
         }
 
         if (($analysis['action'] ?? 'allow') === 'block') {
+            $this->observeTrustedThreat($request);
+            $persistTelemetry = $this->claimTelemetrySample($request, $analysis);
+            if ($persistTelemetry && ! empty($analysis['matched_rules'])) {
+                $this->wafEngine->recordMatchedRules($analysis);
+            }
+
             return $this->dastCorrelation->decorateResponse(
-                $this->handleBlockedRequest($request, $adapter, $analysis),
+                $this->handleBlockedRequest($request, $adapter, $analysis, $persistTelemetry),
                 $correlation,
             );
         }
 
         if (($analysis['action'] ?? 'allow') === 'redirect') {
+            $this->observeTrustedThreat($request);
+            $persistTelemetry = $this->claimTelemetrySample($request, $analysis);
+            if ($persistTelemetry && ! empty($analysis['matched_rules'])) {
+                $this->wafEngine->recordMatchedRules($analysis);
+            }
             $response = $this->handleRedirect($request, $adapter, $analysis);
-            $this->persistWafResult($request, $adapter, $response, $analysis, $startedAt);
+            if ($persistTelemetry) {
+                $this->persistWafResult($request, $adapter, $response, $analysis, $startedAt);
+            }
 
             return $this->dastCorrelation->decorateResponse($response, $correlation);
         }
@@ -76,15 +92,27 @@ class WafMiddleware
                 || $request->expectsJson()
                 || ! $request->isMethod('GET')) {
                 $analysis['block_reason'] = 'Interactive challenge is unavailable for this request';
+                $this->observeTrustedThreat($request);
+                $persistTelemetry = $this->claimTelemetrySample($request, $analysis);
+                if ($persistTelemetry && ! empty($analysis['matched_rules'])) {
+                    $this->wafEngine->recordMatchedRules($analysis);
+                }
 
                 return $this->dastCorrelation->decorateResponse(
-                    $this->handleBlockedRequest($request, $adapter, $analysis),
+                    $this->handleBlockedRequest($request, $adapter, $analysis, $persistTelemetry),
                     $correlation,
                 );
             }
 
+            $this->observeTrustedThreat($request);
+            $persistTelemetry = $this->claimTelemetrySample($request, $analysis);
+            if ($persistTelemetry && ! empty($analysis['matched_rules'])) {
+                $this->wafEngine->recordMatchedRules($analysis);
+            }
             $response = $this->showChallengePage($request, $analysis);
-            $this->persistWafResult($request, $adapter, $response, $analysis, $startedAt);
+            if ($persistTelemetry) {
+                $this->persistWafResult($request, $adapter, $response, $analysis, $startedAt);
+            }
 
             return $this->dastCorrelation->decorateResponse($response, $correlation);
         }
@@ -92,7 +120,24 @@ class WafMiddleware
         $response = $next($request);
         $response->headers->set('X-Cybear-Request-Id', $requestId);
 
-        $this->persistWafResult($request, $adapter, $response, $analysis, $startedAt);
+        if ($this->isTrustedFeedbackResponse($response)) {
+            $this->observeTrustedThreat($request);
+            $persistTelemetry = $this->claimTelemetrySample($request, $analysis);
+            if ($persistTelemetry && ! empty($analysis['matched_rules'])) {
+                $this->wafEngine->recordMatchedRules($analysis);
+            }
+            if ($persistTelemetry) {
+                $this->persistWafResult($request, $adapter, $response, $analysis, $startedAt);
+            }
+        } elseif (! empty($analysis['matched_rules'])) {
+            $persistTelemetry = $this->claimTelemetrySample($request, $analysis);
+            if ($persistTelemetry) {
+                $analysis['feedback_eligible'] = false;
+                $this->persistWafResult($request, $adapter, $response, $analysis, $startedAt);
+            }
+        } else {
+            $this->persistWafResult($request, $adapter, $response, $analysis, $startedAt);
+        }
 
         return $this->dastCorrelation->decorateResponse($response, $correlation);
     }
@@ -102,7 +147,8 @@ class WafMiddleware
         $maximum = max(0, (int) config('cybear.waf.max_request_size', 10 * 1024 * 1024));
         $contentLength = max(0, (int) $request->server('CONTENT_LENGTH', 0));
         $bodyLength = strlen((string) $request->getContent());
-        $observedLength = max($contentLength, $bodyLength);
+        $queryLength = strlen((string) $request->server('QUERY_STRING', ''));
+        $observedLength = max($contentLength, $bodyLength, $queryLength);
 
         if ($maximum > 0 && $observedLength > $maximum) {
             $analysis = [
@@ -130,22 +176,25 @@ class WafMiddleware
         Request $request,
         LaravelRequestAdapter $adapter,
         array $analysis,
+        bool $persistTelemetry = true,
     ): Response {
         $incidentId = (string) Str::uuid();
         $analysis['incident_id'] = $incidentId;
 
-        try {
-            $this->auditLogger->logBlockedRequest(
-                $adapter,
-                $analysis,
-                Auth::id() ? (string) Auth::id() : null,
-                $this->sessionId($request),
-            );
-        } catch (Throwable $exception) {
-            Log::warning('Failed to persist blocked-request telemetry', [
-                'error_type' => $exception::class,
-                'incident_id' => $incidentId,
-            ]);
+        if ($persistTelemetry) {
+            try {
+                $this->auditLogger->logBlockedRequest(
+                    $adapter,
+                    $analysis,
+                    Auth::id() ? (string) Auth::id() : null,
+                    $this->sessionId($request),
+                );
+            } catch (Throwable $exception) {
+                Log::warning('Failed to persist blocked-request telemetry', [
+                    'error_type' => $exception::class,
+                    'incident_id' => $incidentId,
+                ]);
+            }
         }
 
         $headers = [
@@ -395,6 +444,65 @@ class WafMiddleware
             'sha256',
             ($request->ip() ?? '0.0.0.0')."\n".($request->userAgent() ?? ''),
             (string) config('app.key', 'cybear'),
+        );
+    }
+
+    protected function isTrustedFeedbackResponse(Response $response): bool
+    {
+        return $response->getStatusCode() >= 200 && $response->getStatusCode() < 400;
+    }
+
+    protected function observeTrustedThreat(Request $request): void
+    {
+        try {
+            $this->threatReporter->observe($request);
+        } catch (Throwable $exception) {
+            Log::warning('Cybear threat evidence could not be queued', [
+                'error_type' => $exception::class,
+            ]);
+        }
+    }
+
+    protected function claimTelemetrySample(Request $request, array $analysis): bool
+    {
+        if (empty($analysis['matched_rules']) && empty($analysis['degraded'])
+            && empty($analysis['inspection_truncated']) && empty($analysis['rule_id'])) {
+            return true;
+        }
+
+        $seconds = max(0, min(3600, (int) config('cybear.audit.sample_seconds', 10)));
+        if ($seconds === 0) {
+            return true;
+        }
+
+        $ruleStates = array_values(array_filter(array_map(
+            static fn (mixed $match): ?string => is_array($match)
+                && is_string($match['rule_id'] ?? null)
+                    ? implode(':', [
+                        $match['rule_id'],
+                        (int) ($match['version'] ?? 1),
+                        (int) ($match['rollout_percentage'] ?? 100),
+                        (string) ($match['effective_action'] ?? ''),
+                    ])
+                    : null,
+            (array) ($analysis['matched_rules'] ?? []),
+        )));
+        if ($ruleStates === [] && is_string($analysis['rule_id'] ?? null)) {
+            $ruleStates[] = $analysis['rule_id'];
+        }
+        sort($ruleStates);
+        $key = 'cybear:waf-telemetry-sample:'.hash('sha256', implode("\0", [
+            strtoupper($request->method()),
+            $request->route()?->uri() ?? $request->path(),
+            implode(',', $ruleStates),
+            (string) ($analysis['action'] ?? 'allow'),
+        ]));
+
+        Cache::add($key, 0, $seconds);
+
+        return Cache::increment($key) <= max(
+            1,
+            min(100, (int) config('cybear.audit.sample_burst', 2)),
         );
     }
 }

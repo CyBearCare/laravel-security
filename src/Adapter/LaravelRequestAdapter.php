@@ -61,6 +61,27 @@ class LaravelRequestAdapter implements RequestInterface
         return $this->request->all();
     }
 
+    public function getQueryInput(): array
+    {
+        return $this->request->query->all();
+    }
+
+    public function getBodyInput(): array
+    {
+        if ($this->request->isJson()) {
+            $json = $this->request->json()->all();
+
+            return is_array($json) ? $json : [];
+        }
+
+        return $this->request->request->all();
+    }
+
+    public function getRawBody(): string
+    {
+        return (string) $this->request->getContent();
+    }
+
     public function getHeaders(): array
     {
         return $this->request->headers->all();
